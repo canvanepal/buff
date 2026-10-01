@@ -1,0 +1,10 @@
+# NEVER commit the HAR capture — it contains live session tokens (Convex JWTs,
+# OAuth codes) for freebuff.com. Keep it local only.
+freebuff.com.har
+/tmp/
+
+__pycache__/
+*.py[cod]
+
+# local runtime state (installed copies live in ~/.buff anyway)
+.buff/
