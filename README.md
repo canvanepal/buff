@@ -63,6 +63,10 @@ ln -s ~/.buff/buff.py ~/bin/buff     # plus a buff.cmd wrapper on Windows
 | `buff link <from> <to>` | wire one sandbox so it can `ssh` into another |
 | `buff link ls [from]` | list the links configured inside a sandbox |
 | `buff link unlink <from> <to>` | remove a link (config entry + authorized key) |
+| `buff swarm up [--hub N]` | link every saved sandbox into one hub and write the mesh registry |
+| `buff swarm ls [--hub N]` | show the mesh and ping each member |
+| `buff swarm run <tasks-file>` | fan tasks out from the hub to the members |
+| `buff swarm down [--hub N]` | unlink every member and delete the registry |
 
 Flags: `--fast`, `--no-setup` (skip provisioning check), `--token X`, `--cols N`, `--rows M`.
 
@@ -184,6 +188,60 @@ saved sandbox names. `unlink` does a full teardown, not just a config edit:
 If the target sandbox is expired or offline, the config removal still succeeds
 and you get a warning telling you to re-run `unlink` once it's back — the link
 is already unusable in the meantime, since the ssh alias no longer exists.
+
+---
+
+## 5. Swarm: several sandboxes as one agent mesh
+
+`buff swarm` turns your saved sandboxes into a fleet. One becomes the **hub**; the
+others become **members** that the hub can reach over the links above.
+
+```
+buff swarm up --hub mybox     # link main, 1, mainn -> mybox; write registry
+buff swarm ls --hub mybox     # mesh state + live PING_OK per member
+buff swarm down --hub mybox   # full teardown
+```
+
+The registry lives *inside* the hub at `/root/.buff/registry.json`, so the mesh is
+self-describing and survives your laptop being off:
+
+```json
+{"hub": {"name": "mybox", "host": "7681-...e2b.app", "id": "idtg..."},
+ "members": [{"name": "main", "id": "iec7...", "alias": "buff-iec7mdho"}, ...]}
+```
+
+Offline sandboxes are skipped with a warning instead of failing the whole setup.
+
+### Fan-out
+
+```bash
+buff swarm run tasks.md --hub mybox \
+  --repo https://github.com/you/project \
+  --cmd 'claude -p "$(cat /tmp/swarm_task.txt)"'
+```
+
+- tasks are parsed from `- `/`* `/`1. ` list lines (comments and blanks skipped)
+- assigned **round-robin** to the members
+- each member's workspace is `/root/swarm/<hub>/` with `tasks/<n>.md` and `logs/<n>.log`
+- `--repo` clones once per member, then `git pull --ff-only` on later runs
+- `{task}` is substituted with the task text; the command runs **in a subshell** so
+  capturing its log can't override a redirect inside your own command
+- exit codes are collected per task — `buff` exits non-zero if any task failed
+- without `--cmd`, tasks are just materialised as files (a queue you can drain later)
+
+Everything crossing a machine boundary is base64-encoded, so task text and commands
+containing quotes, `$`, newlines or unicode can't be mangled by the terminal.
+
+### Practical notes
+
+- **Cost:** since June 2026 `claude -p` / Agent SDK headless runs are billed outside a
+  Claude subscription. For free parallelism use freebuff's own agents; pay only for the hub.
+- **Latency:** each agent hop costs ~250 ms of E2B edge latency, so prefer
+  async/batch coordination (git, task files) over chatty request/response loops.
+- **Exposure:** members are reachable at their public `https://<port>-<id>.e2b.app`
+  endpoints, so anything you expose needs its own auth token.
+- **Reprovisioning:** when freebuff re-creates a sandbox its id changes — re-run
+  `buff swarm up` to refresh the registry and links.
 
 ---
 

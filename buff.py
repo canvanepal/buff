@@ -14,6 +14,7 @@ Commands:
   buff link <from> <to>    wire one sandbox so it can ssh into another
   buff link ls [from]      list links configured inside a sandbox
   buff link unlink <from> <to>   remove a link (config entry + key)
+  buff swarm up|ls|run|down  orchestrate several sandboxes as an agent mesh
 
 Options:
   --fast               mosh-style predictive local echo (instant keystrokes;
@@ -130,6 +131,25 @@ async def cmd_test(host):
             return True
     except Exception as e:
         print("FAIL", host, "->", type(e).__name__, str(e))
+        return False
+
+
+async def is_live(host):
+    """Quiet liveness probe: can we open the ttyd socket and get shell output?"""
+    import websockets
+
+    token = await fetch_token(host)
+    try:
+        async with websockets.connect("wss://" + host + WS_PATH, subprotocols=["tty"],
+                                      max_size=None, ping_interval=None,
+                                      compression=None, open_timeout=12) as ws:
+            await ws.send(json.dumps({"AuthToken": token, "columns": 80, "rows": 24}).encode())
+            for _ in range(4):
+                msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                if isinstance(msg, bytes) and msg[:1] == b"0":
+                    return True
+            return True
+    except Exception:
         return False
 
 
@@ -472,6 +492,236 @@ async def cmd_link_unlink(from_arg, to_arg):
               + " (sandbox may be offline) - re-run unlink once it is back", file=sys.stderr)
 
 
+# ---------------- swarm: orchestrate sandboxes as an agent mesh ----------------
+# A swarm is one hub sandbox that can ssh into every other sandbox (built with
+# buff link), plus a registry file inside the hub describing the mesh. Tasks are
+# fanned out from the hub to the workers and results come back the same way, so
+# a whole fleet of agents works in parallel while only the hub stays online.
+
+SWARM_REGISTRY = "/root/.buff/registry.json"
+
+
+def parse_tasks(text):
+    """Pull task lines out of a markdown/plain list: '- x', '* x', '1. x'."""
+    tasks = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        for prefix in ("- ", "* ", "+ "):
+            if line.startswith(prefix):
+                line = line[len(prefix):].strip()
+                break
+        else:
+            m = re.match(r"^\d+[.)]\s+(.*)$", line)
+            if m:
+                line = m.group(1).strip()
+        if line:
+            tasks.append(line)
+    return tasks
+
+
+async def write_registry(hub_host, reg):
+    import base64
+
+    payload = base64.b64encode(json.dumps(reg, indent=2).encode()).decode()
+    rc, out = await run_remote(hub_host,
+                               "mkdir -p /root/.buff && echo " + payload + " | base64 -d > "
+                               + SWARM_REGISTRY + "; echo REGISTRY_OK", timeout=60)
+    return "REGISTRY_OK" in out
+
+
+async def read_registry(hub_host):
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]
+    rc, out = await run_remote(hub_host,
+                               "cat " + SWARM_REGISTRY + " 2>/dev/null; echo " + tag + "_x",
+                               timeout=60)
+    if tag + "_x" not in out:
+        return None
+    text = out.split(tag + "_x")[0]
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+
+
+async def remote_upload(host, data, path, timeout=60):
+    """base64-upload bytes to a file inside a sandbox (chunked, newline-safe)."""
+    import base64
+
+    b64 = base64.b64encode(data).decode()
+    chunk = 1500  # multiple of 4 so base64 -d never sees a partial group
+    for i in range(0, len(b64), chunk):
+        part = b64[i:i + chunk]
+        op = ">" if i == 0 else ">>"
+        rc, out = await run_remote(host, "echo " + part + " | base64 -d " + op + " " + path
+                                   + "; echo CHUNK_OK", timeout=timeout)
+        if "CHUNK_OK" not in out:
+            raise RuntimeError("upload to " + path + " failed on the sandbox")
+
+
+async def swarm_up(hub_arg=None):
+    cfg = load_config()
+    if not cfg.get("sandboxes"):
+        sys.exit("no saved sandboxes -- use: buff add <name> <host>")
+    hub_name, hub_host = resolve_target([hub_arg] if hub_arg else None)
+    members = []
+    for name, host in cfg.get("sandboxes", {}).items():
+        if host == hub_host:
+            continue
+        if not await is_live(host):
+            print("  skip (offline): " + name, file=sys.stderr)
+            continue
+        print("* linking " + hub_name + " -> " + name, file=sys.stderr)
+        try:
+            await cmd_link(hub_name, name, {})
+        except SystemExit:
+            print("  link failed: " + name, file=sys.stderr)
+            continue
+        members.append({"name": name, "host": host, "id": sandbox_id(host),
+                        "alias": "buff-" + sandbox_id(host)[:8]})
+    reg = {"hub": {"name": hub_name, "host": hub_host, "id": sandbox_id(hub_host)},
+           "members": members}
+    if not await write_registry(hub_host, reg):
+        sys.exit("could not write the registry inside " + hub_name)
+    print("OK: hub " + hub_name + " with " + str(len(members)) + " member(s)")
+    for m in members:
+        print("  " + m["name"] + " -> " + m["alias"])
+
+
+async def swarm_ls(hub_arg=None):
+    hub_name, hub_host = resolve_target([hub_arg] if hub_arg else None)
+    reg = await read_registry(hub_host)
+    if not reg:
+        print("no swarm registry in " + hub_name + " -- run: buff swarm up")
+        return
+    members = reg.get("members", [])
+    print("swarm hub: " + reg["hub"]["name"] + " (" + reg["hub"]["host"] + ")")
+    if not members:
+        print("  no members")
+        return
+    status = {}
+    script = ("for a in " + " ".join(m["alias"] for m in members) + "; do "
+              "ssh -o BatchMode=yes -o ConnectTimeout=6 $a true >/dev/null 2>&1 "
+              "&& echo PING_OK $a || echo PING_FAIL $a; done")
+    rc, out = await run_remote(hub_host, script, timeout=180)
+    for line in out.splitlines():
+        for key in ("PING_OK ", "PING_FAIL "):
+            if key in line:
+                status[line.split(key)[1].strip()] = key.strip()
+    for m in members:
+        print("  %-10s %-18s %-9s (%s)" % (m["name"], m["alias"],
+                                          status.get(m["alias"], "?"), m["id"]))
+
+
+async def swarm_run(tasks_arg, flags):
+    import base64
+
+    hub_arg = flags.get("hub")
+    hub_name, hub_host = resolve_target([hub_arg] if hub_arg else None)
+    reg = await read_registry(hub_host)
+    if not reg:
+        sys.exit("no swarm registry in " + hub_name + " -- run: buff swarm up")
+    members = reg.get("members", [])
+    if not members:
+        sys.exit("the swarm has no members")
+    if tasks_arg == "-":
+        text = sys.stdin.read()
+    else:
+        p = Path(tasks_arg)
+        if not p.exists():
+            sys.exit("no such task file: " + tasks_arg)
+        text = p.read_text(encoding="utf-8", errors="replace")
+    tasks = parse_tasks(text)
+    if not tasks:
+        sys.exit("no tasks found (use '- ', '* ' or '1. ' lines)")
+    repo = flags.get("repo", "")
+    cmd = flags.get("cmd", "")
+    timeout = int(flags.get("timeout") or 900)
+    ws = "hub-" + re.sub(r"[^A-Za-z0-9]+", "-", hub_name).strip("-")
+
+    buckets = {m["alias"]: [] for m in members}
+    for i, t in enumerate(tasks):
+        buckets[members[i % len(members)]["alias"]].append((i, t))
+
+    failed = 0
+    for m in members:
+        items = buckets[m["alias"]]
+        if not items:
+            continue
+        lines = ["set +e", 'WS=/root/swarm/' + ws,
+                 'mkdir -p "$WS/tasks" "$WS/logs"', 'cd "$WS"']
+        if repo:
+            lines.append('if [ -d repo/.git ]; then git -C repo pull --ff-only; '
+                         'else git clone "' + repo + '" repo; fi')
+        for i, t in items:
+            tb = base64.b64encode(t.encode()).decode()
+            lines.append('echo ' + tb + ' | base64 -d > "$WS/tasks/' + str(i) + '.md"')
+            if cmd:
+                inner = base64.b64encode(
+                    ("echo " + tb + " | base64 -d > /tmp/swarm_task.txt").encode()).decode()
+                lines.append("echo " + inner + " | base64 -d | bash")
+                run = cmd.replace("{task}", '"$(cat /tmp/swarm_task.txt)"')
+                # wrap in a subshell so capturing the log cannot override a
+                # redirection inside the user's own command
+                lines.append("( " + run + " ) > \"$WS/logs/" + str(i) + '.log" 2>&1')
+            lines.append("echo TASK_RESULT " + str(i) + " $?")
+        script_path = "/tmp/swarm_run.sh"
+        await remote_upload(hub_host, ("\n".join(lines) + "\n").encode(), script_path)
+        print("* " + m["name"] + ": " + str(len(items)) + " task(s)", file=sys.stderr)
+        rc, out = await run_remote(hub_host,
+                                   "ssh -o BatchMode=yes " + m["alias"] + " bash -s < "
+                                   + script_path + " 2>&1; echo MEMBER_DONE", timeout=timeout)
+        results = {}
+        for line in out.splitlines():
+            if "TASK_RESULT" in line:
+                parts = line.split("TASK_RESULT")[1].split()
+                if len(parts) >= 2:
+                    try:
+                        results[int(parts[0])] = int(parts[1])
+                    except ValueError:
+                        pass
+        if "MEMBER_DONE" not in out:
+            print("  warning: " + m["name"] + " did not finish (link may be down)",
+                  file=sys.stderr)
+        for i, _t in items:
+            rc_i = results.get(i)
+            if rc_i == 0:
+                print("  " + m["name"] + " task " + str(i) + ": ok")
+            else:
+                failed += 1
+                print("  " + m["name"] + " task " + str(i) + ": FAILED"
+                      + (" (rc=" + str(rc_i) + ")" if rc_i is not None else ""))
+                if cmd:
+                    print("    fetch logs with: buff ssh " + hub_name
+                          + " -- \"ssh " + m["alias"] + " cat /root/swarm/" + ws
+                          + "/logs/" + str(i) + ".log\"")
+                else:
+                    print("    task file: " + m["alias"] + ":/root/swarm/" + ws
+                          + "/tasks/" + str(i) + ".md")
+    print(str(len(tasks)) + " task(s) dispatched to " + str(len(members)) + " member(s), "
+          + str(failed) + " failed")
+    sys.exit(1 if failed else 0)
+
+
+async def swarm_down(hub_arg=None):
+    hub_name, hub_host = resolve_target([hub_arg] if hub_arg else None)
+    reg = await read_registry(hub_host)
+    if not reg:
+        sys.exit("no swarm registry in " + hub_name)
+    for m in reg.get("members", []):
+        print("* unlinking " + hub_name + " -> " + m["name"], file=sys.stderr)
+        await cmd_link_unlink(hub_name, m["name"])
+    rc, out = await run_remote(hub_host, "rm -f " + SWARM_REGISTRY + "; echo REGISTRY_GONE",
+                               timeout=60)
+    print("OK: swarm dismantled")
+
+
 async def main_async():
     # lazy import so `buff ls/rm` works even if websockets is missing
     sys.path.insert(0, str(Path(__file__).parent))
@@ -539,6 +789,24 @@ async def main_async():
         await cmd_link(rest[0], rest[1], flags)
         return
 
+    if cmd == "swarm":
+        flags, rest = split_flags(argv[1:])
+        sub = rest[0] if rest else "ls"
+        hub = flags.get("hub")
+        if sub == "up":
+            await swarm_up(hub)
+        elif sub == "ls":
+            await swarm_ls(hub)
+        elif sub == "run":
+            await swarm_run(rest[1] if len(rest) > 1 else "-", flags)
+        elif sub in ("down", "rm"):
+            await swarm_down(hub)
+        else:
+            sys.exit("usage: buff swarm up|ls|down [--hub NAME]\n"
+                     "       buff swarm run <tasks-file|-> [--hub NAME] [--repo URL] "
+                     "[--cmd 'agent cmd {task}'] [--timeout S]")
+        return
+
     if cmd == "test":
         target = argv[1:] or None
         name, host = resolve_target(target)
@@ -576,7 +844,8 @@ def split_flags(argv):
         elif a == "--no-setup":
             flags["no-setup"] = True
             i += 1
-        elif a in ("--token", "--cols", "--rows") and i + 1 < len(argv):
+        elif a in ("--token", "--cols", "--rows", "--hub", "--repo", "--cmd",
+                   "--timeout") and i + 1 < len(argv):
             flags[a[2:]] = argv[i + 1]
             i += 2
         elif a in ("-h", "--help"):
