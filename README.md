@@ -60,6 +60,7 @@ ln -s ~/.buff/buff.py ~/bin/buff     # plus a buff.cmd wrapper on Windows
 | `buff test [name]` | protocol handshake check, no shell entered |
 | `buff ssh [name] [-- cmd...]` | real SSH into the sandbox |
 | `buff ssh-setup [name]` | provision sshd + ws bridge only, don't connect |
+| `buff link <from> <to>` | wire one sandbox so it can `ssh` into another |
 
 Flags: `--fast`, `--no-setup` (skip provisioning check), `--token X`, `--cols N`, `--rows M`.
 
@@ -132,6 +133,36 @@ existing ttyd websocket so nothing extra needs to be exposed:
 First run downloads `websocat.exe` (Windows) and generates `~/.ssh/id_ed25519`
 if you have none. After `buff ssh-setup` once, `ssh`/`scp`/`rsync` work natively
 against `root@<sandbox-id>` too.
+
+---
+
+## 4. Cross-sandbox linking (`buff link`)
+
+E2B sandboxes are isolated VMs — there is no private network between them, so the
+only path from sandbox A to sandbox B is out through the public websocket bridge:
+
+```
+A  ──ssh──►  A's websocat  ──wss──►  8081-<B>.e2b.app  ──►  B's websocat  ──►  B's sshd
+```
+
+`buff link <from> <to>` wires this up and verifies it:
+
+1. prepares sandbox A — installs `openssh-client` + `websocat`, generates a
+   **dedicated** `~/.ssh/buff_link` keypair (separate from any personal key, so
+   the link is easy to revoke)
+2. ensures B has its ssh bridge (`sshd` + `websocat` on 8081)
+3. authorizes A's link key in B's `authorized_keys`
+4. writes an `~/.ssh/config` entry into A with the `ProxyCommand` hop
+5. runs a live `ssh` from A to B and fails loudly if it doesn't answer
+
+After linking, you can `buff ssh <from>` and then simply:
+
+```bash
+ssh buff-<target-id-prefix>      # lands you inside the other sandbox
+```
+
+Liveness note: if freebuff reprovisions a sandbox its id changes, so re-run
+`buff link` for that pair — the config entry is keyed on the target's id.
 
 ---
 

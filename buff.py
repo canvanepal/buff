@@ -11,6 +11,7 @@ Commands:
   buff test [name]     handshake-check a sandbox without entering it
   buff ssh [name]      real SSH session into the sandbox (auto-provisions sshd)
   buff ssh-setup [name]    provision sshd + websocat bridge without connecting
+  buff link <from> <to>    wire one sandbox so it can ssh into another
 
 Options:
   --fast               mosh-style predictive local echo (instant keystrokes;
@@ -87,6 +88,14 @@ def resolve_target(args):
     return host, host
 
 
+def sandbox_id(host):
+    """'7681-idtgli4wgl5e24mehup90.e2b.app' -> 'idtgli4wgl5e24mehup90'."""
+    sid = host.split(".")[0]
+    if "-" in sid and sid.split("-", 1)[0].isdigit():
+        sid = sid.split("-", 1)[1]
+    return sid
+
+
 async def fetch_token(host):
     """GET https://<host>/token -> token string (may be empty)."""
     import urllib.request
@@ -154,6 +163,51 @@ SETUP_SSH = (
 WEBSOCAT_WIN_URL = (
     "https://github.com/vi/websocat/releases/latest/download/"
     "websocat.x86_64-pc-windows-gnu.exe"
+)
+
+
+# ---------------- cross-sandbox linking (A -> B over the ws bridge) ----------------
+# E2B sandboxes are isolated VMs with no private network between them, so the only
+# path from A to B is A -> wss://8081-<B>.e2b.app -> B's websocat -> B's sshd.
+# We give A its own keypair, authorize that key on B, and drop an ~/.ssh/config
+# entry into A whose ProxyCommand does the websocket hop.
+
+LINK_PREP_A = (
+    "mkdir -p /root/.ssh && chmod 700 /root/.ssh; "
+    "command -v ssh >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1 "
+    "|| { apt-get update -qq && apt-get install -y -qq openssh-client; }; "
+    "if ! command -v websocat >/dev/null 2>&1; then "
+    "curl -fsSL -o /usr/local/bin/websocat "
+    "https://github.com/vi/websocat/releases/latest/download/websocat.x86_64-unknown-linux-musl "
+    "&& chmod +x /usr/local/bin/websocat; fi; "
+    "test -f /root/.ssh/buff_link "
+    "|| ssh-keygen -t ed25519 -N '' -q -f /root/.ssh/buff_link; "
+    "chmod 600 /root/.ssh/buff_link; "
+    "cat /root/.ssh/buff_link.pub; echo A_READY"
+)
+
+LINK_ADD_KEY_B = (
+    "mkdir -p /root/.ssh && chmod 700 /root/.ssh; "
+    "touch /root/.ssh/authorized_keys; "
+    "grep -qsF '__PUBKEY__' /root/.ssh/authorized_keys "
+    "|| echo '__PUBKEY__' >> /root/.ssh/authorized_keys; "
+    "chmod 600 /root/.ssh/authorized_keys; echo B_KEY_OK"
+)
+
+LINK_CONFIG_A = (
+    "mkdir -p /root/.ssh && chmod 700 /root/.ssh; "
+    "touch /root/.ssh/config /root/.ssh/known_hosts; "
+    "chmod 600 /root/.ssh/config /root/.ssh/known_hosts; "
+    "grep -q '^Host __ALIAS__$' /root/.ssh/config || printf '\\nHost __ALIAS__\\n"
+    "  HostName __SID__\\n"
+    "  User root\\n"
+    "  IdentityFile /root/.ssh/buff_link\\n"
+    "  StrictHostKeyChecking accept-new\\n"
+    "  UserKnownHostsFile /root/.ssh/known_hosts\\n"
+    "  ServerAliveInterval 15\\n"
+    "  ProxyCommand /usr/local/bin/websocat --binary -B 65536 - wss://8081-__SID__.e2b.app\\n'"
+    ">> /root/.ssh/config; "
+    "echo CFG_OK"
 )
 
 
@@ -247,9 +301,7 @@ async def cmd_ssh(host, flags, setup_only=False, remote_cmd=None):
         return
 
     # host looks like 7681-<sandboxid>.e2b.app -> bare sandbox id
-    sid = host.split(".")[0]
-    if "-" in sid and sid.split("-", 1)[0].isdigit():
-        sid = sid.split("-", 1)[1]
+    sid = sandbox_id(host)
     wsocat = ensure_local_websocat()
     proxy = (wsocat.replace("\\", "/") + " --binary -B 65536 - wss://8081-"
              + sid + ".e2b.app")
@@ -265,6 +317,60 @@ async def cmd_ssh(host, flags, setup_only=False, remote_cmd=None):
     print("* ssh root@" + sid + "  (real SSH over the e2b websocket bridge)", file=sys.stderr)
     rc = subprocess.call(argv)
     sys.exit(rc)
+
+
+async def cmd_link(from_arg, to_arg, flags):
+    """Wire sandbox <from_arg> so it can ssh into sandbox <to_arg>."""
+    src_name, src = resolve_target([from_arg])
+    dst_name, dst = resolve_target([to_arg])
+    if src == dst:
+        sys.exit("source and target are the same sandbox")
+    src_id, dst_id = sandbox_id(src), sandbox_id(dst)
+    alias = "buff-" + dst_id[:8]
+
+    print("* preparing source sandbox " + src, file=sys.stderr)
+    rc, out = await run_remote(src, LINK_PREP_A, timeout=300)
+    if "A_READY" not in out:
+        print(out[-2000:], file=sys.stderr)
+        sys.exit("source preparation failed (rc=%d)" % rc)
+    pubkey = ""
+    for line in out.splitlines():
+        if line.strip().startswith("ssh-ed25519"):
+            pubkey = line.strip()
+            break
+    if not pubkey:
+        print(out[-2000:], file=sys.stderr)
+        sys.exit("could not read the source sandbox link key")
+
+    print("* ensuring target sandbox has an ssh bridge: " + dst, file=sys.stderr)
+    rc, out = await run_remote(dst, CHECK_SSH, timeout=30)
+    if rc != 0:
+        rc, out = await run_remote(dst, SETUP_SSH, timeout=300)
+        if "SSH_READY" not in out:
+            print(out[-2000:], file=sys.stderr)
+            sys.exit("target provisioning failed (rc=%d)" % rc)
+
+    print("* authorizing the source key on the target", file=sys.stderr)
+    rc, out = await run_remote(dst, LINK_ADD_KEY_B.replace("__PUBKEY__", pubkey), timeout=60)
+    if "B_KEY_OK" not in out:
+        print(out[-2000:], file=sys.stderr)
+        sys.exit("could not authorize the source key (rc=%d)" % rc)
+
+    print("* writing ssh config in the source sandbox", file=sys.stderr)
+    cfg = LINK_CONFIG_A.replace("__ALIAS__", alias).replace("__SID__", dst_id)
+    rc, out = await run_remote(src, cfg, timeout=60)
+    if "CFG_OK" not in out:
+        print(out[-2000:], file=sys.stderr)
+        sys.exit("could not write the source ssh config (rc=%d)" % rc)
+
+    print("* verifying " + src_name + " -> " + dst_name, file=sys.stderr)
+    check = "ssh -o BatchMode=yes " + alias + " 'echo LINK_OK; hostname'"
+    rc, out = await run_remote(src, check, timeout=90)
+    if "LINK_OK" in out:
+        print("OK: " + src_name + " can ssh into " + dst_name + " as  ssh " + alias)
+    else:
+        print(out[-2000:], file=sys.stderr)
+        sys.exit("link verification failed (rc=%d)" % rc)
 
 
 async def main_async():
@@ -314,6 +420,13 @@ async def main_async():
         if tail and tail[0] == "--":
             tail = tail[1:]
         await cmd_ssh(host, flags, setup_only=(cmd == "ssh-setup"), remote_cmd=tail)
+        return
+
+    if cmd == "link":
+        flags, rest = split_flags(argv[1:])
+        if len(rest) != 2:
+            sys.exit("usage: buff link <from-sandbox> <to-sandbox>")
+        await cmd_link(rest[0], rest[1], flags)
         return
 
     if cmd == "test":
