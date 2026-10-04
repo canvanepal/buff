@@ -12,6 +12,8 @@ Commands:
   buff ssh [name]      real SSH session into the sandbox (auto-provisions sshd)
   buff ssh-setup [name]    provision sshd + websocat bridge without connecting
   buff link <from> <to>    wire one sandbox so it can ssh into another
+  buff link ls [from]      list links configured inside a sandbox
+  buff link unlink <from> <to>   remove a link (config entry + key)
 
 Options:
   --fast               mosh-style predictive local echo (instant keystrokes;
@@ -210,6 +212,44 @@ LINK_CONFIG_A = (
     "echo CFG_OK"
 )
 
+LINK_LS_A = "cat /root/.ssh/config 2>/dev/null; echo LSDLIST_DONE"
+
+LINK_UNLINK_A = (
+    "test -f /root/.ssh/config || { echo NOCONFIG; exit 0; }; "
+    "cp /root/.ssh/config /root/.ssh/config.bak; "
+    "awk 'BEGIN{skip=0} /^Host __ALIAS__$/ {skip=1; next} /^Host / {skip=0} !skip' "
+    "/root/.ssh/config > /root/.ssh/config.new "
+    "&& mv /root/.ssh/config.new /root/.ssh/config; "
+    "chmod 600 /root/.ssh/config; "
+    "grep -q '^Host __ALIAS__$' /root/.ssh/config && echo STILL_THERE || echo UNLINK_OK"
+)
+
+LINK_REVOKE_B = (
+    "test -f /root/.ssh/authorized_keys || { echo NOKEYFILE; exit 0; }; "
+    "grep -vF '__PUBKEY__' /root/.ssh/authorized_keys > /root/.ssh/ak.new || true; "
+    "cat /root/.ssh/ak.new > /root/.ssh/authorized_keys; "
+    "rm -f /root/.ssh/ak.new; chmod 600 /root/.ssh/authorized_keys; echo REVOKE_OK"
+)
+
+LINK_PUBKEY_A = "cat /root/.ssh/buff_link.pub 2>/dev/null; echo PUBKEY_DONE"
+
+LINK_RE = re.compile(r"wss://8081-([A-Za-z0-9_-]+)\.e2b\.app")
+
+
+def parse_link_config(text):
+    """Pull (alias, target-sandbox-id) pairs out of a sandbox ssh_config."""
+    links, alias = [], None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("Host "):
+            alias = line.split(None, 1)[1].strip()
+            continue
+        m = LINK_RE.search(line)
+        if m and alias:
+            links.append((alias, m.group(1)))
+            alias = None
+    return links
+
 
 async def run_remote(host, script, timeout=300):
     """Run a bash script inside the sandbox through the ttyd websocket.
@@ -373,6 +413,65 @@ async def cmd_link(from_arg, to_arg, flags):
         sys.exit("link verification failed (rc=%d)" % rc)
 
 
+async def cmd_link_ls(src_arg=None):
+    """List the sandbox->sandbox links configured inside a sandbox."""
+    if src_arg:
+        name, host = resolve_target([src_arg])
+    else:
+        name, host = resolve_target(None)
+    rc, out = await run_remote(host, LINK_LS_A, timeout=60)
+    links = parse_link_config(out)
+    names = {}
+    for saved_name, saved_host in load_config().get("sandboxes", {}).items():
+        names[sandbox_id(saved_host)] = saved_name
+    if not links:
+        print("no links in " + name + " (" + host + ")")
+        return
+    print("links in " + name + " (" + host + "):")
+    for alias, target_id in links:
+        label = names.get(target_id)
+        print("  %-18s -> %s (%s)" % (alias, label if label else "?", target_id))
+
+
+async def cmd_link_unlink(from_arg, to_arg):
+    """Remove a sandbox->sandbox link: config entry in A + key on B."""
+    src_name, src = resolve_target([from_arg])
+    dst_name, dst = resolve_target([to_arg])
+    if src == dst:
+        sys.exit("source and target are the same sandbox")
+    alias = "buff-" + sandbox_id(dst)[:8]
+
+    print("* removing the ssh config entry in " + src, file=sys.stderr)
+    rc, out = await run_remote(src, LINK_UNLINK_A.replace("__ALIAS__", alias), timeout=60)
+    if "STILL_THERE" in out:
+        sys.exit("could not remove the ssh config entry (rc=%d)" % rc)
+
+    rc, out = await run_remote(src, LINK_PUBKEY_A, timeout=60)
+    pubkey = ""
+    for line in out.splitlines():
+        if line.strip().startswith("ssh-ed25519"):
+            pubkey = line.strip()
+            break
+    if not pubkey:
+        print("OK: removed " + src_name + " -> " + dst_name + " (was: ssh " + alias + ")")
+        print("warning: could not read the link key; a stale key may remain on "
+              + dst_name, file=sys.stderr)
+        return
+
+    revoked = False
+    try:
+        rc, out = await run_remote(dst, LINK_REVOKE_B.replace("__PUBKEY__", pubkey),
+                                   timeout=60)
+        revoked = "REVOKE_OK" in out
+    except Exception:
+        revoked = False  # target may be expired/offline; config removal still stands
+
+    print("OK: removed " + src_name + " -> " + dst_name + " (was: ssh " + alias + ")")
+    if not revoked:
+        print("warning: could not revoke the key on " + dst_name
+              + " (sandbox may be offline) - re-run unlink once it is back", file=sys.stderr)
+
+
 async def main_async():
     # lazy import so `buff ls/rm` works even if websockets is missing
     sys.path.insert(0, str(Path(__file__).parent))
@@ -424,8 +523,19 @@ async def main_async():
 
     if cmd == "link":
         flags, rest = split_flags(argv[1:])
+        sub = rest[0] if rest else None
+        if sub in ("ls", "list"):
+            await cmd_link_ls(rest[1] if len(rest) > 1 else None)
+            return
+        if sub in ("rm", "unlink"):
+            if len(rest) != 3:
+                sys.exit("usage: buff link unlink <from> <to>")
+            await cmd_link_unlink(rest[1], rest[2])
+            return
         if len(rest) != 2:
-            sys.exit("usage: buff link <from-sandbox> <to-sandbox>")
+            sys.exit("usage: buff link <from> <to>\n"
+                     "       buff link ls [from]\n"
+                     "       buff link unlink <from> <to>")
         await cmd_link(rest[0], rest[1], flags)
         return
 

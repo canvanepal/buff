@@ -61,6 +61,8 @@ ln -s ~/.buff/buff.py ~/bin/buff     # plus a buff.cmd wrapper on Windows
 | `buff ssh [name] [-- cmd...]` | real SSH into the sandbox |
 | `buff ssh-setup [name]` | provision sshd + ws bridge only, don't connect |
 | `buff link <from> <to>` | wire one sandbox so it can `ssh` into another |
+| `buff link ls [from]` | list the links configured inside a sandbox |
+| `buff link unlink <from> <to>` | remove a link (config entry + authorized key) |
 
 Flags: `--fast`, `--no-setup` (skip provisioning check), `--token X`, `--cols N`, `--rows M`.
 
@@ -163,6 +165,25 @@ ssh buff-<target-id-prefix>      # lands you inside the other sandbox
 
 Liveness note: if freebuff reprovisions a sandbox its id changes, so re-run
 `buff link` for that pair — the config entry is keyed on the target's id.
+
+### Managing links
+
+```bash
+buff link ls                 # links inside the default sandbox
+buff link ls mybox           # links inside a specific sandbox
+buff link unlink mybox main  # remove the link
+```
+
+`ls` reads the sandbox's own `ssh_config` and resolves target ids back to your
+saved sandbox names. `unlink` does a full teardown, not just a config edit:
+
+1. strips the `Host` block from the source sandbox's `~/.ssh/config`
+   (keeping a `config.bak` alongside it)
+2. revokes the source's link key from the target's `authorized_keys`
+
+If the target sandbox is expired or offline, the config removal still succeeds
+and you get a warning telling you to re-run `unlink` once it's back — the link
+is already unusable in the meantime, since the ssh alias no longer exists.
 
 ---
 
