@@ -17,7 +17,7 @@ Speaks the ttyd v1 websocket protocol (decoded from the ttyd client bundle):
       '2' (0x32) PING    : keepalive
 
 Usable as a CLI:
-  python ttyd_bridge.py wss://7681-<sandbox-id>.e2b.app/ws [--cols N] [--rows N] [--token TOKEN]
+  python ttyd_bridge.py wss://7681-<sandbox-id>.e2b.app/ws [--cols N] [--rows N] [--token TOKEN] [--tmux] [--no-reconnect]
 
 Or imported by other tools (see buff.py):
   from ttyd_bridge import run_session
@@ -36,6 +36,7 @@ from collections import deque
 
 try:
     import websockets
+    import websockets.exceptions  # explicit: needed at import time for RECOVERABLE
 except ImportError:
     websockets = None
 
@@ -244,12 +245,40 @@ async def pump_output(ws, sess):
                 await ws.send(OUT_PING)
 
 
-async def pump_input(ws, cols, rows, token, sess):
-    """Local keyboard -> server. Returns when user hits Ctrl+]."""
-    import threading
+async def pump_input(ws, q, cols, rows, token, sess, tmux=False):
+    """Handshake + keystroke queue -> server. Returns when user hits Ctrl+].
 
-    loop = asyncio.get_running_loop()
-    q: asyncio.Queue = asyncio.Queue()
+    The keystroke queue is owned by run_session (not this coroutine) so the
+    same queue - and the raw-mode reader feeding it - survives reconnects.
+    """
+    # handshake: auth JSON as raw binary bytes (server detects the leading '{')
+    auth = json.dumps({"AuthToken": token, "columns": cols, "rows": rows})
+    await ws.send(auth.encode())
+    await ws.send(IN_RESIZE + json.dumps({"columns": cols, "rows": rows}).encode())
+    if tmux:
+        # Enter (or re-attach to) a persistent tmux session so work inside it
+        # survives a dropped connection: this line runs again in every fresh
+        # shell after a reconnect and `tmux -A` reattaches to the same
+        # session. Falls back to a plain shell (with a note) if tmux is absent.
+        await ws.send(IN_INPUT + b"command -v tmux >/dev/null 2>&1 "
+                                 b"&& exec tmux new -A -s buff "
+                                 b"|| echo 'buff: tmux not available - plain shell'\r")
+    while True:
+        data = await q.get()
+        if data == b"\x1d":  # Ctrl+] = exit
+            return
+        if sess.fast:
+            sess.key(data)  # renders local predictions; sends data unchanged
+        await ws.send(IN_INPUT + data)
+
+
+def start_reader(q):
+    """Put the local console in raw mode and feed keystrokes into q.
+
+    Returns the restore function that puts the console back to normal.
+    The reader runs on a daemon thread so it dies with the process.
+    """
+    import threading
 
     if sys.platform == "win32":
         import msvcrt
@@ -276,50 +305,248 @@ async def pump_input(ws, cols, rows, token, sess):
                     return
 
     threading.Thread(target=reader, daemon=True).start()
+    return restore
 
-    # handshake: auth JSON as raw binary bytes (server detects the leading '{')
-    auth = json.dumps({"AuthToken": token, "columns": cols, "rows": rows})
-    await ws.send(auth.encode())
-    await ws.send(IN_RESIZE + json.dumps({"columns": cols, "rows": rows}).encode())
 
+async def backoff_wait(q, delay):
+    """Sleep `delay` seconds; return True if the user hit Ctrl+] meanwhile.
+
+    Keys typed during the outage are dropped: they were meant for a shell
+    that no longer exists.
+    """
+    deadline = time.monotonic() + delay
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            data = await asyncio.wait_for(q.get(), timeout=min(remaining, 0.25))
+        except asyncio.TimeoutError:
+            continue
+        if data == b"\x1d":
+            return True
+
+
+WS_PATH = "/ws"
+
+RECOVERABLE = (
+    websockets.exceptions.WebSocketException,  # ConnectionClosed, InvalidStatus, ...
+    OSError,           # connection refused / DNS / edge unreachable
+    TimeoutError,      # open_timeout / ping_timeout (asyncio.TimeoutError is an alias)
+)
+
+# What the edge's refusal usually means, measured against freebuff sandboxes:
+#   - the access token trimmed off the URL       -> 404
+#   - nothing listening on that port inside the VM -> 502
+# The 502 case is per-port, not per-sandbox: observed with sandbox 1, whose
+# ttyd on 7681 was down while its sshd/websocat bridge on 8081 answered fine.
+HANDSHAKE_HINTS = {
+    404: "sandbox rejected the URL - the host is missing its /<access-token> "
+         "path; copy the whole URL from freebuff.com",
+    502: "nothing is answering on that port: the sandbox's ttyd is not "
+         "running. Open the terminal on freebuff.com once to start it (the "
+         "sandbox itself may still be up)",
+    503: "sandbox is starting up or restarting",
+}
+
+
+def http_status(exc):
+    """HTTP status behind a failed websocket handshake, or None."""
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    if code is None and exc is not None:
+        match = re.search(r"\b(4\d\d|5\d\d)\b", str(exc))
+        code = int(match.group(1)) if match else None
+    return code
+
+
+def _remote_agents_fn(url, token=None):
+    """Sync callable (for the popup watcher) listing the sandbox's tmux sessions.
+
+    The host keeps its path: a freebuff sandbox may need the URL's access token
+    as a route prefix, and urlparse().hostname alone would drop it (every poll
+    then answering 404/502).
+    """
     try:
-        while True:
-            data = await q.get()
-            if data == b"\x1d":  # Ctrl+] = exit
-                return
-            if sess.fast:
-                sess.key(data)  # renders local predictions; sends data unchanged
-            await ws.send(IN_INPUT + data)
-    finally:
-        restore()
+        from urllib.parse import urlparse
+        parts = urlparse(url)
+        host = parts.netloc or ""
+        path = (parts.path or "").rstrip("/")
+        if path.endswith(WS_PATH):
+            path = path[:-len(WS_PATH)]
+        host += path
+    except Exception:
+        host = ""
+    if not host.split("/")[0].endswith(".e2b.app"):
+        return None      # the path (the access token) is what follows the host
+
+    def _fn():
+        try:
+            import asyncio
+            import buff  # lazy: keeps standalone ttyd_bridge usable
+            # reuse the session's AuthToken: the watcher must not re-ask /token
+            # every few seconds (that is what flooded the terminal with
+            # 'could not fetch token: HTTP Error 502')
+            names = asyncio.run(buff.remote_agents(host, token=token))
+            return [{"name": n, "state": "running"} for n in names]
+        except Exception:
+            return None
+
+    return _fn
 
 
-async def run_session(url, token="", cols=None, rows=None, fast=False):
-    """Run an interactive bridge session. fast=True enables predictive local echo."""
+async def run_session(url, token="", cols=None, rows=None, fast=False,
+                      tmux=False, reconnect=True, input_queue=None,
+                      popup=False):
+    """Run an interactive bridge session.
+
+    fast=True enables predictive local echo. tmux=True keeps work alive
+    across drops by running the shell inside `tmux new -A -s buff` (every
+    reconnect re-attaches to that same session). reconnect=True (default)
+    automatically redials after a dropped or refused connection with capped
+    backoff; Ctrl+] during the wait quits. A clean remote close (code 1000 -
+    the user typed exit) ends the session instead of reconnecting. The
+    input_queue parameter lets tests inject keys instead of driving the real
+    console. popup=True opens the fun animated status buddy (best-effort:
+    its own process, closes itself when this session ends).
+    """
     if cols is None or rows is None:
         import shutil
         size = shutil.get_terminal_size((120, 30))
         cols = cols or size.columns
         rows = rows or size.lines
-    sess = FastEcho(fast=fast)
 
-    async with websockets.connect(
-        url,
-        subprotocols=["tty"],
-        max_size=None,
-        ping_interval=None,  # ttyd has its own opcode-level ping
-        compression=None,
-        open_timeout=15,
-    ) as ws:
-        done, pending = await asyncio.wait(
-            [asyncio.create_task(pump_output(ws, sess)),
-             asyncio.create_task(pump_input(ws, cols, rows, token, sess))],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in pending:
-            t.cancel()
-        for t in done:
-            t.result()  # re-raise errors
+    if input_queue is None:
+        q: asyncio.Queue = asyncio.Queue()
+        restore = start_reader(q)
+    else:
+        q, restore = input_queue, None
+
+    # fun status popup: own process, never blocks or breaks the session
+    ph = watch = None
+    if popup:
+        try:
+            from buff_popup import start_popup, popup_state
+            ph = start_popup("buff 📡")
+            popup_state(ph, "connecting")
+        except Exception:
+            ph = None
+    if ph is not None:
+        try:
+            from buff_popup import agent_watch
+            watch = agent_watch(ph, remote_fn=_remote_agents_fn(url, token))
+        except Exception:
+            watch = None
+
+    attempt = 0
+    failed = False        # did we give up, or did the user leave?
+    try:
+        while True:
+            sess = FastEcho(fast=fast)  # fresh prediction state per connection
+            t_connect = time.monotonic()
+            drop = exc = None
+            try:
+                async with websockets.connect(
+                    url,
+                    subprotocols=["tty"],
+                    max_size=None,
+                    # The E2B edge kills idle websockets after ~60s (abnormal
+                    # close 1006) and ttyd sends no keepalives of its own, so
+                    # client-side pings are the only thing keeping the session
+                    # (and its shell) alive while the user pauses mid-work.
+                    # Verified on the wire: no ping -> dead at 63s,
+                    # ping every 15s -> survives 240s+ idle and stays writable.
+                    ping_interval=15,
+                    ping_timeout=15,
+                    compression=None,
+                    open_timeout=15,
+                ) as ws:
+                    if ph is not None:
+                        try:
+                            popup_state(ph, "working")
+                        except Exception:
+                            pass
+                    out_task = asyncio.create_task(pump_output(ws, sess))
+                    in_task = asyncio.create_task(
+                        pump_input(ws, q, cols, rows, token, sess, tmux=tmux))
+                    try:
+                        done, _pending = await asyncio.wait(
+                            [out_task, in_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        # user pressed Ctrl+]: input side returned cleanly
+                        if (in_task in done and not in_task.cancelled()
+                                and in_task.exception() is None):
+                            return
+                        exc = next((t.exception() for t in done
+                                   if not t.cancelled()
+                                   and t.exception() is not None), None)
+                        if exc is not None and not isinstance(exc, RECOVERABLE):
+                            failed = True
+                            raise exc  # a real bug - never mask it with a retry
+                        if ws.close_code == 1000:
+                            return  # remote shell exited cleanly (user typed exit)
+                        drop = ("closed with code %s" % ws.close_code
+                                if ws.close_code is not None else repr(exc))
+                    finally:
+                        for t in (out_task, in_task):
+                            if not t.done():
+                                t.cancel()
+                        await asyncio.gather(out_task, in_task,
+                                             return_exceptions=True)
+            except RECOVERABLE as e:
+                exc = e
+                drop = "%s: %s" % (type(e).__name__, e)
+
+            if not reconnect:
+                if exc is not None:
+                    failed = True
+                    raise exc
+                return
+            if time.monotonic() - t_connect >= 30:
+                attempt = 0  # last connection was healthy - restart backoff
+            attempt += 1
+            delay = min(2 ** (attempt - 1), 15)  # 1s, 2s, 4s, 8s, 15s, ...
+            status = http_status(exc)
+            if status in (404, 502, 503):
+                # The handshake itself was refused: this is not a dropped link,
+                # it is the edge saying the sandbox is not there. Say which, and
+                # do not hammer it every second while it boots.
+                delay = max(delay, min(10 * attempt, 30))
+            if ph is not None:
+                try:
+                    popup_state(ph, "reconnecting")
+                except Exception:
+                    pass
+            hint = HANDSHAKE_HINTS.get(status)
+            if hint and attempt == 1:
+                sys.stderr.write("* %s (HTTP %d, Ctrl+] to quit)\r\n"
+                                 % (hint, status))
+            sys.stderr.write("* connection lost (%s) - reconnecting in %ds "
+                             "(attempt %d, Ctrl+] to quit)\r\n"
+                             % (drop, delay, attempt))
+            sys.stderr.flush()
+            if await backoff_wait(q, delay):
+                return
+    finally:
+        if restore is not None:
+            restore()
+        if watch is not None:
+            try:
+                from buff_popup import stop_watch
+                stop_watch(watch)
+            except Exception:
+                pass
+        if ph is not None:
+            try:
+                from buff_popup import popup_state, stop_popup
+                if failed:
+                    # it did not just end, it broke: say so, and let the child
+                    # hold that face up for a moment after we are gone
+                    popup_state(ph, "error")
+                stop_popup(ph, linger=failed)
+            except Exception:
+                pass
 
 
 def main():
@@ -332,11 +559,20 @@ def main():
     p.add_argument("--rows", type=int, default=None)
     p.add_argument("--fast", action="store_true",
                    help="mosh-style predictive local echo (helps on high-latency links)")
+    p.add_argument("--tmux", action="store_true",
+                   help="run the shell inside tmux so work survives reconnects")
+    p.add_argument("--no-reconnect", action="store_true",
+                   help="exit when the connection drops instead of redialing")
+    p.add_argument("--no-popup", action="store_true",
+                   help="don't show the animated status popup")
     args = p.parse_args()
 
     try:
         asyncio.run(run_session(args.url, token=args.token, cols=args.cols,
-                                rows=args.rows, fast=args.fast))
+                                rows=args.rows, fast=args.fast,
+                                tmux=args.tmux,
+                                reconnect=not args.no_reconnect,
+                                popup=not args.no_popup))
     except (KeyboardInterrupt, websockets.exceptions.ConnectionClosed):
         print("\n* session closed", file=sys.stderr)
 

@@ -30,8 +30,10 @@ from your terminal:
 # install (this repo)
 pip install websockets          # only runtime dependency
 
-# tell buff where your sandbox lives (host shown in the freebuff.com page URL)
+# tell buff where your sandbox lives (copy the URL from the freebuff.com page;
+# paste it whole - newer sandboxes carry an access token after the host)
 buff add mybox 7681-<sandbox-id>.e2b.app
+buff add mybox 7681-<sandbox-id>.e2b.app/<access-token>
 
 buff                # connect (last-used sandbox)
 buff --fast         # connect with mosh-style predictive echo
@@ -55,7 +57,7 @@ ln -s ~/.buff/buff.py ~/bin/buff     # plus a buff.cmd wrapper on Windows
 |---|---|
 | `buff` | connect to the last-used (or only) saved sandbox |
 | `buff [--fast] <name\|host>` | connect to a named sandbox; `--fast` = predictive echo |
-| `buff add <name> <host>` | save a sandbox host |
+| `buff add <name> <host\|url>` | save a sandbox host (a pasted URL keeps its access token) |
 | `buff ls` / `buff rm <name>` | list / remove saved sandboxes |
 | `buff test [name]` | protocol handshake check, no shell entered |
 | `buff ssh [name] [-- cmd...]` | real SSH into the sandbox |
@@ -68,7 +70,8 @@ ln -s ~/.buff/buff.py ~/bin/buff     # plus a buff.cmd wrapper on Windows
 | `buff swarm run <tasks-file>` | fan tasks out from the hub to the members |
 | `buff swarm down [--hub N]` | unlink every member and delete the registry |
 
-Flags: `--fast`, `--no-setup` (skip provisioning check), `--token X`, `--cols N`, `--rows M`.
+Flags: `--fast`, `--no-setup` (skip provisioning check), `--token X` (sandbox
+access token, see below), `--cols N`, `--rows M`.
 
 Exit an interactive session with **Ctrl+]**.
 
@@ -102,6 +105,30 @@ page JS inside the capture:
 
 `/token` returns `{"token": ""}` — auth is effectively open (that's freebuff's
 design, not a bug we introduced).
+
+### 1b. The access token in the URL
+
+Newer sandboxes are addressed with a token in the path:
+
+```
+7681-<sandbox-id>.e2b.app/2019afe1572ebc097dbb3d953163e1ddb22762b...
+```
+
+That segment is part of the **route**, not a password — measured against a live
+sandbox: with the path in place, an empty, a correct and a deliberately wrong
+`AuthToken` all connect and get shell output; the same host with the path
+trimmed answers **404** (`/ws` and `/token` alike), and a sandbox that is not
+running answers **502**. So the token has to be carried in every URL `buff`
+builds, which is why it is kept with the host rather than sent only in the
+handshake:
+
+```bash
+buff add 2 7681-<sandbox-id>.e2b.app/<access-token>   # paste the URL whole
+buff --token <access-token> 7681-<sandbox-id>.e2b.app  # or supply it per run
+```
+
+Sandboxes whose URL has no token are unaffected: no prefix is added, and `/ws`
+is used as-is. `buff ls` shows `+token` for entries that carry one.
 
 ### 2. Interactive bridge (`ttyd_bridge.py`)
 
@@ -139,6 +166,27 @@ existing ttyd websocket so nothing extra needs to be exposed:
 First run downloads `websocat.exe` (Windows) and generates `~/.ssh/id_ed25519`
 if you have none. After `buff ssh-setup` once, `ssh`/`scp`/`rsync` work natively
 against `root@<sandbox-id>` too.
+
+Steps 1–3 need the ttyd port, but the bridge in step 3 uses its own port: a
+sandbox whose ttyd is down still answers on 8081, so `buff ssh` warns that it
+could not check the provisioning and tries the bridge anyway rather than
+refusing.
+
+---
+
+## Troubleshooting: HTTP 502 from the edge
+
+E2B returns 502 **per port**, so it never means "this sandbox is gone":
+
+- `buff ssh <name>` works while `buff <name>` 502s? The VM is up — its `sshd`
+  and the websocat bridge on 8081 are listening — but **ttyd on 7681 is not
+  running**. freebuff starts ttyd when its web terminal is opened, so open the
+  terminal on freebuff.com once and the port comes alive (`ttyd 1.7.7` is
+  already installed in the image at `/usr/local/bin/ttyd`).
+- Verified inside such a sandbox: `ss -ltnp` shows `:22`, `:8081` (`websocat`)
+  and envd, but nothing on `:7681`, and `pgrep ttyd` finds no process.
+- `buff` prints that hint once on the first refused handshake and then backs
+  off 10–30s instead of redialling every second.
 
 ---
 
@@ -281,8 +329,10 @@ only real fix client-side is predictive echo.
   authorization code. Anyone with the file could hijack the session. Never share
   a HAR unsanitized; if you need one for analysis, redact `authorization` headers
   and cookies first.
-- `buff` fetches a fresh token from `https://<host>/token` at every connect; it
-  is never persisted to disk.
+- `buff` fetches a fresh AuthToken from `https://<host>/token` at connect time
+  and caches it in memory for a minute; it is never persisted to disk. A failed
+  fetch is cached and warned about only once per host, so a sandbox that has no
+  such endpoint (or is asleep) cannot flood the terminal with warnings.
 - The sandbox's ttyd and `/token` endpoint are unauthenticated by freebuff's
   design — treat the sandbox host like a password and don't publish it.
 - SSH keys are standard `~/.ssh/id_ed25519`; the pubkey is the only thing written

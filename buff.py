@@ -19,11 +19,29 @@ Commands:
 Options:
   --fast               mosh-style predictive local echo (instant keystrokes;
                        auto-disabled in full-screen apps like vim)
+  --tmux               run the remote shell inside tmux, so work survives a
+                       dropped connection (reconnects re-attach to it)
+  --no-reconnect       exit the session when the connection drops instead of
+                       auto-redialing with backoff (default: auto-reconnect;
+                       also applies to `buff ssh`)
+  --no-popup           don't show the animated status-buddy popup window
   --no-setup           skip sandbox ssh provisioning check
-  --token TOKEN        override the auth token (fetched fresh by default)
+  --token TOKEN        sandbox access token (the /<token> part of the URL the
+                       freebuff.com page shows)
   --cols N --rows M    terminal size override
 
-The token is always fetched fresh from https://<host>/token at connect time.
+Newer sandboxes put an **access token in the URL path**:
+
+  7681-xxxxxxxxxxxxxxxx.e2b.app/2019afe1572ebc097dbb3d953163e1ddb22762b...
+
+That segment is part of the *route*, not a password: the E2B edge rejects the
+request before ttyd ever sees it, which is why a URL with the token trimmed off
+answers 404 (or 502 once the sandbox is asleep). Paste the whole URL into
+`buff add <name> <url>`, or pass the bare token with --token.
+
+The shell's own AuthToken is separate and is fetched from
+https://<host>/token when that endpoint answers (it is optional: a sandbox that
+does not use AuthToken returns an empty one).
 Type Ctrl+] to leave the session.
 """
 
@@ -81,14 +99,18 @@ def resolve_target(args):
 
     # not a saved name -> treat the argument itself as a host or full URL
     host = name
-    for prefix in ("https://", "wss://"):
+    for prefix in ("https://", "http://", "wss://", "ws://"):
         if host.startswith(prefix):
             host = host[len(prefix):]
-    host = host.split("/")[0]
-    if ".e2b.app" not in host and "localhost" not in host and "127.0.0.1" not in host:
+    host = host.strip().strip("/")
+    bare = host.split("/")[0]
+    if (".e2b.app" not in bare and "localhost" not in bare
+            and "127.0.0.1" not in bare):
         print(name, "is not a saved sandbox and does not look like a sandbox host.")
         sys.exit(1)
-    return host, host
+    # keep the path: that segment is the access token, and dropping it is what
+    # turns a working URL into a 404/502 handshake failure
+    return bare, host
 
 
 def sandbox_id(host):
@@ -99,23 +121,74 @@ def sandbox_id(host):
     return sid
 
 
-async def fetch_token(host):
-    """GET https://<host>/token -> token string (may be empty)."""
+# ------------------------------------------------------- access token routing
+# A freebuff URL carries its access token as a path segment:
+#
+#     7681-xxxxxxxx.e2b.app/2019afe1572ebc097db...
+#
+# It is NOT the ttyd AuthToken. Measured against a live sandbox: a correct,
+# empty and deliberately wrong AuthToken are all accepted once the path is
+# right, while the same host without the path segment answers 404/502. So the
+# token has to ride in every URL we build (websocket and /token alike).
+TOKEN_FAIL_TTL = 120.0   # a host that cannot answer /token stays quiet this long
+TOKEN_OK_TTL = 60.0
+_token_cache = {}        # host -> (expiry, token)
+_token_warned = set()    # hosts already warned about, once per process
+
+
+def split_token(entry):
+    """'host/<token>' -> ('host', '<token>'); ('host', '') when there is none."""
+    host, sep, token = (entry or "").partition("/")
+    return host.strip().strip("/"), (token.strip().strip("/") if sep else "")
+
+
+def with_token(host, token):
+    """Route `host` through `token`, unless it already carries one."""
+    bare, existing = split_token(host)
+    if not token or existing:
+        return host
+    return bare + "/" + token
+
+
+async def fetch_token(host, override=None, quiet=False):
+    """AuthToken from https://<host>/token -> str ('' when the sandbox has none).
+
+    Failures are cached and warned about only once per host: the popup's agent
+    watcher asks again every few seconds, and a warning per poll buries the
+    terminal it is printed in (the fix for a screen full of
+    'could not fetch token: HTTP Error 502').
+    """
+    import time as _time
     import urllib.request
+
+    if override:
+        return override
+
+    now = _time.monotonic()
+    cached = _token_cache.get(host)
+    if cached and cached[0] > now:
+        return cached[1]
 
     url = "https://" + host + "/token"
     try:
         with urllib.request.urlopen(url, timeout=10) as r:
-            return json.loads(r.read().decode()).get("token", "")
+            token = json.loads(r.read().decode()).get("token", "") or ""
+        _token_cache[host] = (now + TOKEN_OK_TTL, token)
+        return token
     except Exception as e:
-        print("warning: could not fetch token:", e, file=sys.stderr)
+        _token_cache[host] = (now + TOKEN_FAIL_TTL, "")
+        if not quiet and host not in _token_warned:
+            _token_warned.add(host)
+            print("warning: could not fetch token:", e, file=sys.stderr)
+            print("  (harmless when the sandbox has no AuthToken; it just means"
+                  " the /token endpoint did not answer)", file=sys.stderr)
         return ""
 
 
-async def cmd_test(host):
+async def cmd_test(host, token=None):
     import websockets
 
-    token = await fetch_token(host)
+    token = await fetch_token(host, override=token)
     url = "wss://" + host + WS_PATH
     try:
         async with websockets.connect(url, subprotocols=["tty"], max_size=None,
@@ -271,24 +344,73 @@ def parse_link_config(text):
     return links
 
 
-async def run_remote(host, script, timeout=300):
-    """Run a bash script inside the sandbox through the ttyd websocket.
-    Returns (returncode, output). Uses base64 so nothing in the script can be
-    confused with terminal echo, and a random marker to detect completion."""
-    import base64
-    import uuid
+class SandboxUnreachable(RuntimeError):
+    """The sandbox refused the websocket handshake (asleep, wrong URL, gone).
+
+    Raised instead of letting websockets' InvalidStatus/OSError escape, so the
+    CLI can explain the problem in one line rather than printing a traceback.
+    """
+
+    def __init__(self, host, status=None, detail=""):
+        self.host = host
+        self.status = status
+        self.detail = detail
+        super().__init__("%s refused the connection%s"
+                         % (host, "" if status is None
+                            else " (HTTP %d)" % status))
+
+    def friendly(self):
+        """One actionable line (shared wording with the reconnect loop)."""
+        try:
+            from ttyd_bridge import HANDSHAKE_HINTS
+            hint = HANDSHAKE_HINTS.get(self.status)
+        except Exception:
+            hint = None
+        if hint:
+            return hint
+        if self.status:
+            return "the sandbox answered HTTP %d" % self.status
+        return "could not reach the sandbox (%s)" % (self.detail or "no response")
+
+
+async def connect_sandbox(host, token=None):
+    """Open the ttyd socket, or raise SandboxUnreachable with the reason."""
     import websockets
 
-    token = await fetch_token(host)
-    url = "wss://" + host + WS_PATH
+    token = await fetch_token(host, override=token)
+    try:
+        ws = await websockets.connect("wss://" + host + WS_PATH,
+                                      subprotocols=["tty"], max_size=None,
+                                      ping_interval=15,   # E2B edge kills idle
+                                      ping_timeout=15,    # ws at ~60s (1006)
+                                      compression=None, open_timeout=15)
+    except (websockets.exceptions.WebSocketException, OSError,
+            TimeoutError) as e:
+        try:
+            from ttyd_bridge import http_status
+            status = http_status(e)
+        except Exception:
+            status = None
+        raise SandboxUnreachable(host, status, str(e)) from e
+    return ws, token
+
+
+async def run_remote(host, script, timeout=300, token=None):
+    """Run a bash script inside the sandbox through the ttyd websocket.
+    Returns (returncode, output). Uses base64 so nothing in the script can be
+    confused with terminal echo, and a random marker to detect completion.
+    `token` is an AuthToken to reuse instead of asking /token again.
+    Raises SandboxUnreachable when the sandbox will not talk to us at all."""
+    import base64
+    import uuid
+
+    ws, token = await connect_sandbox(host, token)
     tag = uuid.uuid4().hex[:8]
     payload = base64.b64encode(script.encode()).decode()
     line = "echo " + payload + " | base64 -d | bash; echo " + tag + "_$?"
     pat = re.compile((tag + r"_(\d+)").encode())
     buf = b""
-    async with websockets.connect(url, subprotocols=["tty"], max_size=None,
-                                  ping_interval=None, compression=None,
-                                  open_timeout=15) as ws:
+    async with ws:
         await ws.send(json.dumps({"AuthToken": token, "columns": 200, "rows": 50}).encode())
         await ws.send(b'1{"columns":200,"rows":50}')
         await ws.send(b"0" + line.encode() + b"\r")
@@ -338,26 +460,140 @@ def ensure_local_websocat():
     return str(dest)
 
 
+REMOTE_AGENTS_SCRIPT = "tmux list-sessions -F 'S:#{session_name}' 2>/dev/null; true"
+
+
+async def remote_agents(host, timeout=15, token=None):
+    """List tmux sessions running in the sandbox (for the popup panel)."""
+    rc, out = await run_remote(host, REMOTE_AGENTS_SCRIPT, timeout=timeout,
+                               token=token)
+    from buff_popup import parse_tmux
+    return parse_tmux(out)
+
+
+def remote_agents_fn(host, timeout=15, token=None):
+    """Sync callable (for the popup watcher thread) listing sandbox tmux sessions."""
+    def _fn():
+        try:
+            names = asyncio.run(remote_agents(host, timeout=timeout,
+                                              token=token))
+            return [{"name": n, "state": "running"} for n in names]
+        except Exception:
+            return None
+    return _fn
+
+
+def run_ssh(argv, reconnect=True, popup=False, call=None, sleep=None, host=None):
+    """Run the ssh subprocess, auto-reconnecting when the bridge drops.
+
+    ssh exits 255 on connection errors; after a successful first connect the
+    common cause is the websocket bridge dying mid-session. Retry with capped
+    backoff until a non-255 exit (normal exit / command result), the user
+    gives up (reconnect=False), or Ctrl+C during the backoff wait. popup=True
+    shows the fun animated status buddy (best-effort, own process).
+    """
+    import subprocess
+
+    ph = watch = None
+    if popup:
+        try:
+            from buff_popup import start_popup, popup_state
+            ph = start_popup("buff ssh")
+            popup_state(ph, "ssh")
+        except Exception:
+            ph = None
+    if ph is not None:
+        try:
+            from buff_popup import agent_watch
+            watch = agent_watch(ph, remote_fn=remote_agents_fn(host) if host else None)
+        except Exception:
+            watch = None
+
+    call = call if call is not None else subprocess.call
+    sleep = sleep if sleep is not None else time.sleep
+    delay = 1.0
+    attempt = 0
+    failed = False
+    try:
+        while True:
+            rc = call(argv)
+            if rc != 255 or not reconnect:
+                failed = rc == 255      # a dead bridge, not a clean exit
+                return rc
+            attempt += 1
+            if ph is not None:
+                try:
+                    popup_state(ph, "reconnecting")
+                except Exception:
+                    pass
+            print("* ssh connection lost (rc=255) -- reconnecting in %.0fs "
+                  "(Ctrl+C to abort)" % delay, file=sys.stderr)
+            try:
+                sleep(delay)
+            except KeyboardInterrupt:
+                return 130
+            delay = min(delay * 2, 10.0)
+    finally:
+        if watch is not None:
+            try:
+                from buff_popup import stop_watch
+                stop_watch(watch)
+            except Exception:
+                pass
+        if ph is not None:
+            try:
+                from buff_popup import popup_state, stop_popup
+                if failed:
+                    # the bridge died rather than the user leaving: say so, and
+                    # let the child hold that face up for a moment
+                    popup_state(ph, "error")
+                stop_popup(ph, linger=failed)
+            except Exception:
+                pass
+
+
 async def cmd_ssh(host, flags, setup_only=False, remote_cmd=None):
     import shutil
-    import subprocess
 
     if shutil.which("ssh") is None:
         sys.exit("OpenSSH client not found. Install Windows OpenSSH or Git for Windows.")
 
     pubkey = ensure_local_key()
     ensure_local_websocat()  # local tunnel binary (also used by the session below)
+    checked = provisioned = False
     if not flags.get("no-setup"):
-        rc, out = await run_remote(host, CHECK_SSH, timeout=30)
-        if rc != 0:
+        try:
+            rc, out = await run_remote(host, CHECK_SSH, timeout=30)
+            checked, provisioned = True, rc == 0
+        except SandboxUnreachable as e:
+            # Provisioning rides on ttyd (port 7681), but the ssh bridge uses
+            # its own port (8081), and a sandbox that is up with ttyd down is
+            # exactly the case where ssh still works. So warn and try it
+            # instead of refusing on a check that could not run.
+            print("* " + e.friendly(), file=sys.stderr)
+            print("  (could not check sshd/websocat - trying the ssh bridge "
+                  "anyway)", file=sys.stderr)
+        if checked and not provisioned:
             print("* provisioning sshd + websocat inside sandbox (one-time)...", file=sys.stderr)
             script = SETUP_SSH.replace("__PUBKEY__", pubkey)
             rc, out = await run_remote(host, script, timeout=300)
             if "SSH_READY" not in out:
                 print(out[-2000:], file=sys.stderr)
                 sys.exit("ssh provisioning failed (rc=%d)" % rc)
+            checked = provisioned = True
     if setup_only:
-        print("OK: sshd is up in", host)
+        if provisioned:
+            # print the bare host: the entry carries the access token in its path
+            print("OK: sshd is up in", split_token(host)[0])
+        elif flags.get("no-setup"):
+            print("* skipped the sshd check (--no-setup)", file=sys.stderr)
+        else:
+            # never claim the sshd is up when we could not look
+            print("* could not check or provision sshd in %s: ttyd is not "
+                  "answering on 7681. The ssh bridge uses its own port, so "
+                  "`buff ssh %s` may still work." % (host, host),
+                  file=sys.stderr)
+            sys.exit(1)
         return
 
     # host looks like 7681-<sandboxid>.e2b.app -> bare sandbox id
@@ -369,13 +605,23 @@ async def cmd_ssh(host, flags, setup_only=False, remote_cmd=None):
             "-o", "ProxyCommand=" + proxy,
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=" + str(CONFIG_DIR / "known_hosts"),
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-            "root@" + sid]
+            "-o", "ServerAliveInterval=15",   # keepalive traffic through the
+            "-o", "ServerAliveCountMax=3",    # ws bridge (edge kills idle ~60s)
+            "-o", "ConnectTimeout=20"]
+    if flags.get("tmux") and not remote_cmd:
+        # force a tty: after a drop, the reconnect loop re-runs this and
+        # `tmux -A` re-attaches to the same work
+        argv.append("-tt")
+    argv.append("root@" + sid)
     if remote_cmd:
         argv.extend(remote_cmd)
+    elif flags.get("tmux"):
+        # land in a persistent tmux session (plain bash if tmux is absent)
+        argv.append("if command -v tmux >/dev/null 2>&1; then "
+                    "exec tmux new -A -s buff; else exec bash; fi")
     print("* ssh root@" + sid + "  (real SSH over the e2b websocket bridge)", file=sys.stderr)
-    rc = subprocess.call(argv)
+    rc = run_ssh(argv, reconnect=not flags.get("no-reconnect", False),
+                 popup=not flags.get("no-popup", False), host=host)
     sys.exit(rc)
 
 
@@ -732,19 +978,30 @@ async def main_async():
 
     if cmd == "add":
         if len(argv) != 3:
-            sys.exit("usage: buff add <name> <host>")
+            sys.exit("usage: buff add <name> <host|url>")
+        host = argv[2].strip()
+        for prefix in ("https://", "http://", "wss://", "ws://"):
+            if host.startswith(prefix):
+                host = host[len(prefix):]
+        host = host.rstrip("/")
         cfg = load_config()
-        cfg.setdefault("sandboxes", {})[argv[1]] = argv[2]
+        cfg.setdefault("sandboxes", {})[argv[1]] = host
         cfg["last"] = argv[1]
         save_config(cfg)
-        print("saved:", argv[1], "->", argv[2], "(now the default)")
+        bare, access = split_token(host)
+        print("saved:", argv[1], "->", bare, "(now the default)")
+        if access:
+            print("  with a %d-character access token" % len(access))
         return
 
     if cmd == "ls":
         cfg = load_config()
         for name, host in cfg.get("sandboxes", {}).items():
+            bare, access = split_token(host)
+            if access:
+                bare += "  +token"
             marker = "  (default)" if name == cfg.get("last") else ""
-            print("%-20s %s%s" % (name, host, marker))
+            print("%-20s %s%s" % (name, bare, marker))
         if not cfg.get("sandboxes"):
             print("no sandboxes saved -- use: buff add <name> <host>")
         return
@@ -764,6 +1021,7 @@ async def main_async():
     if cmd in ("ssh", "ssh-setup"):
         flags, rest = split_flags(argv[1:])
         name, host = resolve_target(rest or None)
+        host = with_token(host, flags.get("token"))
         # anything after the target (optionally separated by --) is the remote command
         tail = rest[1:] if rest else []
         if tail and tail[0] == "--":
@@ -808,8 +1066,9 @@ async def main_async():
         return
 
     if cmd == "test":
-        target = argv[1:] or None
-        name, host = resolve_target(target)
+        flags, rest = split_flags(argv[1:])
+        name, host = resolve_target(rest or None)
+        host = with_token(host, flags.get("token"))
         ok = await cmd_test(host)
         sys.exit(0 if ok else 1)
 
@@ -817,7 +1076,10 @@ async def main_async():
     flags, rest = split_flags(argv)
     extra = [] if not rest else [rest[0]]
     name, host = resolve_target(extra)
-    print("* connecting to", host, "... (Ctrl+] to exit)", file=sys.stderr)
+    host = with_token(host, flags.get("token"))    # --token rides in the route
+    bare, access = split_token(host)
+    print("* connecting to", bare + (" (access token)" if access else ""),
+          "... (Ctrl+] to exit)", file=sys.stderr)
     if not flags.get("fast"):
         print("  tip: use 'buff --fast' for instant keystroke echo on slow links", file=sys.stderr)
     token = await fetch_token(host)
@@ -827,7 +1089,10 @@ async def main_async():
         cfg["last"] = name
         save_config(cfg)
     try:
-        await run_session(url, token=token, fast=flags.get("fast", False))
+        await run_session(url, token=token, fast=flags.get("fast", False),
+                          tmux=flags.get("tmux", False),
+                          reconnect=not flags.get("no-reconnect", False),
+                          popup=not flags.get("no-popup", False))
     except Exception as e:
         print()
         print("* session ended:", type(e).__name__, str(e), file=sys.stderr)
@@ -840,6 +1105,15 @@ def split_flags(argv):
         a = argv[i]
         if a == "--fast":
             flags["fast"] = True
+            i += 1
+        elif a == "--tmux":
+            flags["tmux"] = True
+            i += 1
+        elif a == "--no-reconnect":
+            flags["no-reconnect"] = True
+            i += 1
+        elif a == "--no-popup":
+            flags["no-popup"] = True
             i += 1
         elif a == "--no-setup":
             flags["no-setup"] = True
@@ -863,6 +1137,16 @@ def main():
     except KeyboardInterrupt:
         print()
         print("* bye", file=sys.stderr)
+    except SandboxUnreachable as e:
+        # Every remote helper funnels through run_remote, so an unreachable
+        # sandbox arrives here instead of as a websockets traceback.
+        print(file=sys.stderr)
+        print("* " + e.friendly(), file=sys.stderr)
+        print("  (%s%s)" % (e.host, "" if e.status is None
+                            else ", HTTP %d" % e.status), file=sys.stderr)
+        if e.status in (502, 503):
+            print("  check with: buff test <name>", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
