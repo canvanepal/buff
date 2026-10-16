@@ -114,13 +114,16 @@ Newer sandboxes are addressed with a token in the path:
 7681-<sandbox-id>.e2b.app/2019afe1572ebc097dbb3d953163e1ddb22762b...
 ```
 
-That segment is part of the **route**, not a password — measured against a live
-sandbox: with the path in place, an empty, a correct and a deliberately wrong
-`AuthToken` all connect and get shell output; the same host with the path
-trimmed answers **404** (`/ws` and `/token` alike), and a sandbox that is not
-running answers **502**. So the token has to be carried in every URL `buff`
-builds, which is why it is kept with the host rather than sent only in the
-handshake:
+That segment is the **workspace gateway's token** *and* the route to it: E2B
+forwards the path to the service, and the gateway compares the first segment
+against `~/.local/state/freebuff/terminal-7681.token` (measured: the 64-byte
+file has the same md5 as the segment from freebuff.com — see "What actually
+serves port 7681" below). It is not the ttyd `AuthToken`: with the path in
+place, an empty, a correct and a deliberately wrong `AuthToken` all connect and
+get shell output, the same host with the path trimmed answers **404** (`/ws` and
+`/token` alike), and a port with nothing listening answers **502**. So the token
+has to be carried in every URL `buff` builds, which is why it is kept with the
+host rather than sent only in the handshake:
 
 ```bash
 buff add 2 7681-<sandbox-id>.e2b.app/<access-token>   # paste the URL whole
@@ -179,14 +182,40 @@ refusing.
 E2B returns 502 **per port**, so it never means "this sandbox is gone":
 
 - `buff ssh <name>` works while `buff <name>` 502s? The VM is up — its `sshd`
-  and the websocat bridge on 8081 are listening — but **ttyd on 7681 is not
-  running**. freebuff starts ttyd when its web terminal is opened, so open the
-  terminal on freebuff.com once and the port comes alive (`ttyd 1.7.7` is
-  already installed in the image at `/usr/local/bin/ttyd`).
+  and the websocat bridge on 8081 are listening — but **nothing is listening on
+  port 7681**, which is the port your browser terminal (and `buff` itself) talks
+  to. Only freebuff's own side can provide that listener; see below.
 - Verified inside such a sandbox: `ss -ltnp` shows `:22`, `:8081` (`websocat`)
-  and envd, but nothing on `:7681`, and `pgrep ttyd` finds no process.
+  and envd, but nothing on `:7681`, and `pgrep ttyd` finds no process at all.
 - `buff` prints that hint once on the first refused handshake and then backs
   off 10–30s instead of redialling every second.
+
+### What actually serves port 7681
+
+Measured on a sandbox that *does* answer (and the reason the `/<token>` in the
+URL matters, see 1b):
+
+```
+E2B edge  ──►  TCP :7681  ──►  workspace-gateway-v2.js (node)  ──unix socket──►  ttyd
+```
+
+- The listener on `:7681` is **not** ttyd. `ss -ltnp` attributes it to `node`
+  running `…/freebuff/workspace-gateway-v2.js terminal 7681 …/terminal-7681.sock
+  …/terminal-7681.token -- ttyd …`.
+- ttyd binds a **unix socket**, not the port: its argv is
+  `ttyd -i …/state/freebuff/terminal-7681.sock -W -t theme {…} …
+  /usr/local/share/freebuff/ttyd-shell-v4-7681.sh`, and that script is what
+  execs the shell (`bash` with freebuff's `--rcfile`).
+- `terminal-7681.token` holds the secret the URL carries: the md5 of that
+  64-byte file matches the `/<64-hex>` segment from freebuff.com exactly. That is
+  also why ttyd's own `AuthToken` handshake field is not checked (see 1b) — the
+  gateway in front of the socket is the gate, and ttyd is never exposed.
+- The gateway is started by the workspace itself (parent is PID 1), not by us.
+  A sandbox that never got one (e.g. an older image: `ttyd-shell-v3`, empty
+  `~/.local/share/freebuff/`) has nothing on 7681 and will 502 no matter what
+  flags `buff` is given. Whether opening the terminal on freebuff.com
+  provisions the gateway on such a box is **not verified** — `buff test <name>`
+  is the quick way to tell.
 
 ---
 
