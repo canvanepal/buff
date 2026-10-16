@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>baking</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: transparent; }
+    svg { display: block; }
+  </style>
+</head>
+<body>
+  <script type="module">
+    import { createDefinition, sampleExpression } from './open-mascot-studio-main/packages/open-mascot/src/index.js'
+    import { buildScene } from './open-mascot-studio-main/packages/open-mascot/src/scene.js'
+    import { renderSceneToSvgString } from './open-mascot-studio-main/packages/open-mascot/src/web.js'
+
+    const q = new URLSearchParams(location.search)
+    const expr = q.get('expr') || 'curious'
+    const px = Number(q.get('px') || 1120)          // rendered size of the 560 viewBox
+    try {
+      const def = createDefinition({
+        name: 'buff',
+        shape: q.get('shape') || 'soft',
+        color: q.get('color') || '#12161d',
+        eyeShape: q.get('eye') || 'oval',
+        eyeColor: q.get('eyeColor') || '#f0f3f7',
+        renderMode: 'projected-3d',
+      })
+      const scene = buildScene(def, sampleExpression(def, expr, Number(q.get('t') || 0)))
+      scene.background = 'transparent'   // no stage fill
+      scene.shadow.opacity = 0           // no ground shadow: it floats
+      const markup = renderSceneToSvgString(scene, { label: expr })
+      document.body.insertAdjacentHTML('afterbegin',
+        markup.replace('<svg ', '<svg width="' + px + '" height="' + px + '" '))
+      document.title = 'ready ' + expr
+    } catch (e) {
+      document.title = 'ERR: ' + (e && e.message)
+    }
+  </script>
+</body>
+</html>
